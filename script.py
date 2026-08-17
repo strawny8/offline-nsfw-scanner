@@ -9,6 +9,7 @@ from datetime import datetime
 import glob
 import uuid
 import cv2
+import zipfile
 
 all_labels = [
     "BUTTOCKS_EXPOSED",
@@ -90,12 +91,15 @@ def create_new_report(report_number, summary=False):
     
 
 
-def update_report(report_file, image_path, matched_classes):
+def update_report(report_file, image_path, matched_classes, display_path=None):
+    # Use display_path for labels if provided (e.g. for zip entries), otherwise use image_path
+    label_path = display_path if display_path else image_path
     # Replace single backslashes with double backslashes
     image_path_escaped = image_path.replace('\\', '\\\\')
+    label_path_escaped = label_path.replace('\\', '\\\\')
     
     # Get only the filename with extension
-    file_name_with_extension = os.path.basename(image_path)
+    file_name_with_extension = os.path.basename(label_path)
     matched_classes_str = ',<br>'.join([f"{item['class']} [{item['score']:.2f}]" for item in matched_classes])
     match_scores_avg = round(sum(item['score'] for item in matched_classes) / len(matched_classes), 2) if matched_classes else 0
 
@@ -111,10 +115,10 @@ def update_report(report_file, image_path, matched_classes):
             </a>
             <br>
             <div class="file-info">
-            <span class="file-path-label" onclick="copyToClipboard('{image_path_escaped}')">{file_name_with_extension}</span>
-            <span class="file-description" onclick="copyToClipboard('{image_path_escaped}')">Matched Classes:<br>{matched_classes_str}<br></span>
-            <span class="average-scores" onclick="copyToClipboard('{image_path_escaped}')">[avg: {match_scores_avg}]</span>
-            <span class="clipboard-button" onclick="copyToClipboard('{image_path_escaped}')"><Button>{clipboard_emoji}</Button></span>
+            <span class="file-path-label" onclick="copyToClipboard('{label_path_escaped}')">{file_name_with_extension}</span>
+            <span class="file-description" onclick="copyToClipboard('{label_path_escaped}')">Matched Classes:<br>{matched_classes_str}<br></span>
+            <span class="average-scores" onclick="copyToClipboard('{label_path_escaped}')">[avg: {match_scores_avg}]</span>
+            <span class="clipboard-button" onclick="copyToClipboard('{label_path_escaped}')"><Button>{clipboard_emoji}</Button></span>
             </div>
         </li>
         """)
@@ -405,7 +409,6 @@ def clear_console():
     sys.stdout.write("\033[H\033[J")  # ANSI escape code to clear the screen
 
 
-
 def is_complex_image(image_path):
     # Load the image
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -426,6 +429,75 @@ def is_complex_image(image_path):
     
     # Assuming a threshold of 5 contours to distinguish between simple and complex images
     return len(contours_thresh) > 5 or len(contours_edges) > 5
+
+
+def scan_zip_file(zip_path, nude_detector, report_number, error_log_number, images_with_detections):
+    """Extract a zip file to a temp cache folder, scan all images inside, then clean up."""
+    global previous_report_number
+    global found
+
+    zip_uid = uuid.uuid4().hex
+    temp_dir = os.path.join('cache', f'zip_temp_{zip_uid}')
+
+    try:
+        os.makedirs(temp_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(temp_dir)
+        print(f"Scanning zip: {os.path.basename(zip_path)}")
+    except Exception as e:
+        log_error(error_log_number, f"Failed to extract zip {zip_path}: {str(e)}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return report_number
+
+    for root, _, inner_files in os.walk(temp_dir):
+        for inner_file in inner_files:
+            if not inner_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                continue
+
+            full_path = os.path.join(root, inner_file)
+            # Label in report shows original zip path >> internal file path
+            display_path = f"{zip_path} >> {os.path.relpath(full_path, temp_dir)}"
+
+            try:
+                img = Image.open(full_path)
+                img.close()
+            except Exception as e:
+                log_error(error_log_number, f"Error opening {full_path} from zip {zip_path}: {str(e)}")
+                continue
+
+            try:
+                if not is_complex_image(full_path):
+                    continue
+                detections = nude_detector.detect(full_path)
+            except Exception as e:
+                log_error(error_log_number, f"Error detecting nudity in {full_path} from zip {zip_path}: {str(e)}")
+                continue
+
+            matched_classes = [
+                {'class': item['class'], 'score': item['score']}
+                for item in detections
+                if item['class'] in all_labels and item.get('score', 0) > default_detection_score
+            ]
+
+            detected = any(item['class'] in all_labels for item in matched_classes)
+
+            if detected:
+                found += 1
+                images_with_detections.append(display_path)
+                print(f"Detected inside zip: {display_path}")
+
+                current_report_size = os.path.getsize(get_report_filename(report_number))
+                if current_report_size >= 200 * 1024:
+                    previous_report_number = report_number
+                    report_number += 1
+                    create_new_report(report_number)
+
+                # Pass display_path so report labels show zip source, not temp path
+                update_report(get_report_filename(report_number), full_path, matched_classes, display_path=display_path)
+
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    return report_number
+
 
 def scan_directory(directory, report_number, error_log_number):
     global previous_report_number
@@ -450,8 +522,17 @@ def scan_directory(directory, report_number, error_log_number):
         for file in files:
         
             pbar.update(1)  # Update the progress bar for each processed image
+
+            full_path = os.path.abspath(os.path.join(subdir, file))
+
+            # --- ZIP SUPPORT ---
+            if file.lower().endswith('.zip'):
+                pbar.set_postfix(current_file=f'[ZIP] {file}')
+                report_number = scan_zip_file(full_path, nude_detector, report_number, error_log_number, images_with_detections)
+                clean_cache_directory('cache', max_cache_size_bytes)
+                continue
+
             if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                full_path = os.path.abspath(os.path.join(subdir, file))
                 sanitized_filename = sanitize_filename(file)
 
                 try:
