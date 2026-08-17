@@ -475,7 +475,7 @@ def handle_detection(matched_classes, full_path, report_number_ref, images_with_
     global found, previous_report_number
 
     label = display_path or full_path
-    print(f"  [DETECTED] {os.path.basename(label)}")
+    print(f"  [DETECTED] {os.path.basename(label)}", flush=True)
 
     with report_lock:
         found += 1
@@ -494,31 +494,51 @@ def handle_detection(matched_classes, full_path, report_number_ref, images_with_
 
 def _extract_archive(archive_path, temp_dir, error_log_number):
     """
-    Extract any supported archive type to temp_dir.
+    Extract any supported archive type to temp_dir with live progress output.
     Returns True on success, False on failure.
     """
     lower = archive_path.lower()
+    name = os.path.basename(archive_path)
     try:
         if lower.endswith('.zip'):
             with zipfile.ZipFile(archive_path, 'r') as zf:
-                zf.extractall(temp_dir)
+                members = zf.namelist()
+                total = len(members)
+                print(f"\n  [ZIP] Extracting {total} entries from: {name}", flush=True)
+                for i, member in enumerate(members, 1):
+                    zf.extract(member, temp_dir)
+                    if i % 200 == 0 or i == total:
+                        print(f"\r  [ZIP] Extracting... {i}/{total} entries", end='', flush=True)
+                print(f"\r  [ZIP] Extraction complete: {total} entries from {name}     ", flush=True)
         elif lower.endswith('.7z'):
             if not HAS_7Z:
                 log_error(error_log_number, f"py7zr not installed, skipping {archive_path}")
                 return False
+            print(f"\n  [7Z] Extracting: {name} (this may take a while)...", flush=True)
             with py7zr.SevenZipFile(archive_path, mode='r') as sz:
+                all_files = sz.getnames()
+                print(f"  [7Z] {len(all_files)} entries found — extracting...", flush=True)
                 sz.extractall(path=temp_dir)
+            print(f"  [7Z] Extraction complete: {name}", flush=True)
         elif lower.endswith('.rar'):
             if not HAS_RAR:
                 log_error(error_log_number, f"rarfile not installed, skipping {archive_path}")
                 return False
             with rarfile.RarFile(archive_path, 'r') as rf:
-                rf.extractall(temp_dir)
+                members = rf.namelist()
+                total = len(members)
+                print(f"\n  [RAR] Extracting {total} entries from: {name}", flush=True)
+                for i, member in enumerate(members, 1):
+                    rf.extract(member, temp_dir)
+                    if i % 200 == 0 or i == total:
+                        print(f"\r  [RAR] Extracting... {i}/{total} entries", end='', flush=True)
+                print(f"\r  [RAR] Extraction complete: {total} entries from {name}     ", flush=True)
         else:
             return False
         return True
     except Exception as e:
         log_error(error_log_number, f"Failed to extract {archive_path}: {e}")
+        print(f"\n  [!] Failed to extract {name}: {e}", flush=True)
         return False
 
 
@@ -526,29 +546,55 @@ def scan_archive(archive_path, report_number_ref, error_log_number, images_with_
     archive_uid = uuid.uuid4().hex
     temp_dir = os.path.join('cache', f'arc_temp_{archive_uid}')
     ext = os.path.splitext(archive_path)[1].upper()
+    name = os.path.basename(archive_path)
 
     try:
         os.makedirs(temp_dir, exist_ok=True)
+        print(f"\n[{ext}] Found archive: {name}", flush=True)
         if not _extract_archive(archive_path, temp_dir, error_log_number):
+            shutil.rmtree(temp_dir, ignore_errors=True)
             return
-        print(f"\n[{ext}] Scanning: {os.path.basename(archive_path)}")
     except Exception as e:
         log_error(error_log_number, f"Archive setup error {archive_path}: {e}")
+        print(f"  [!] Archive setup error for {name}: {e}", flush=True)
         shutil.rmtree(temp_dir, ignore_errors=True)
         return
 
-    for root, _, inner_files in os.walk(temp_dir):
-        for inner_file in inner_files:
+    # Collect all image files from the extracted archive
+    image_files = [
+        os.path.join(root, f)
+        for root, _, files in os.walk(temp_dir)
+        for f in files
+        if f.lower().endswith(extensions)
+    ]
+
+    img_count = len(image_files)
+    if img_count == 0:
+        print(f"  [ARC] No scannable images found inside {name}", flush=True)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return
+
+    print(f"  [ARC] Scanning {img_count} image(s) inside {name}...", flush=True)
+
+    with tqdm(
+        total=img_count,
+        desc=f"  {ext} {name[:40]}",
+        position=1,
+        leave=False,
+        dynamic_ncols=True,
+        unit='img'
+    ) as arc_pbar:
+        for full_path in image_files:
             if _shutdown.is_set():
                 break
-            if not inner_file.lower().endswith(extensions):
-                continue
-            full_path = os.path.join(root, inner_file)
+            arc_pbar.set_postfix(f=os.path.basename(full_path)[:35])
             display_path = f"{archive_path} >> {os.path.relpath(full_path, temp_dir)}"
             matched = scan_image(full_path, error_log_number)
             if matched:
                 handle_detection(matched, full_path, report_number_ref, images_with_detections, display_path=display_path)
+            arc_pbar.update(1)
 
+    print(f"  [ARC] Done scanning {name} — {img_count} image(s) processed", flush=True)
     shutil.rmtree(temp_dir, ignore_errors=True)
 
 # ---------------------------------------------------------------------------
@@ -578,6 +624,9 @@ def scan_directory(directory, report_number_ref, error_log_number, extensions, e
             break
 
         dirs[:] = [d for d in dirs if d not in exclude_dirs]
+
+        # Announce each directory so user can see progress through the tree
+        print(f"\n[DIR] {subdir}  ({len(files)} file(s))", flush=True)
 
         pbar = tqdm(
             total=len(files),
