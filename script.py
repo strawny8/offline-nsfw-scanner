@@ -13,6 +13,19 @@ import glob
 import uuid
 import cv2
 import zipfile
+import signal
+
+try:
+    import py7zr
+    HAS_7Z = True
+except ImportError:
+    HAS_7Z = False
+
+try:
+    import rarfile
+    HAS_RAR = True
+except ImportError:
+    HAS_RAR = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -31,14 +44,25 @@ all_labels = [
 ]
 
 # ---------------------------------------------------------------------------
-# Global state (protected by a lock for thread safety)
+# Global state
 # ---------------------------------------------------------------------------
 
 found = 0
 default_detection_score = 0.6
 previous_report_number = None
+output_dir = 'reports'
+
 report_lock = threading.Lock()
-state_lock = threading.Lock()
+state_lock  = threading.Lock()
+_shutdown   = threading.Event()
+
+# Per-thread NudeDetector — NudeDetector is not thread-safe
+_thread_local = threading.local()
+
+def get_detector():
+    if not hasattr(_thread_local, 'detector'):
+        _thread_local.detector = NudeDetector()
+    return _thread_local.detector
 
 # ---------------------------------------------------------------------------
 # Cache / Directory helpers
@@ -52,31 +76,34 @@ def get_cache_filename(filename):
 
 def create_reports_directory():
     formatted_date = datetime.now().strftime("%d%m%Y_%H%M")
-    reports_dir = os.path.join("reports", f"reports_{formatted_date}")
+    reports_dir = os.path.join(output_dir, f"reports_{formatted_date}")
     os.makedirs(reports_dir, exist_ok=True)
 
 def get_latest_report_directory():
-    dirs = sorted(d for d in glob.glob(os.path.join('reports', 'reports_*')) if os.path.isdir(d))
+    pattern = os.path.join(output_dir, 'reports_*')
+    dirs = sorted(d for d in glob.glob(pattern) if os.path.isdir(d))
     return dirs[-1] if dirs else None
 
 def get_report_filename(report_number, local=False):
     if local:
         return f'nudenet_report_{report_number}.html'
     latest = get_latest_report_directory()
-    if latest:
-        return os.path.join(latest, f'nudenet_report_{report_number}.html')
-    return os.path.join('reports', f'nudenet_report_{report_number}.html')
+    base = latest if latest else output_dir
+    return os.path.join(base, f'nudenet_report_{report_number}.html')
 
 # ---------------------------------------------------------------------------
-# Scan state / resume support
+# Checkpoint / resume
 # ---------------------------------------------------------------------------
 
 CHECKPOINT_FILE = 'scan_checkpoint.json'
 
 def load_checkpoint():
     if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
-            return set(json.load(f).get('scanned', []))
+        try:
+            with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
+                return set(json.load(f).get('scanned', []))
+        except Exception:
+            pass
     return set()
 
 def save_checkpoint(scanned_paths):
@@ -86,7 +113,10 @@ def save_checkpoint(scanned_paths):
 
 def clear_checkpoint():
     if os.path.exists(CHECKPOINT_FILE):
-        os.remove(CHECKPOINT_FILE)
+        try:
+            os.remove(CHECKPOINT_FILE)
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Report helpers
@@ -102,6 +132,7 @@ def create_new_report(report_number, summary=False):
 
 
 def update_report(report_file, image_path, matched_classes, display_path=None):
+    """Inject detection card before </ul> so HTML stays valid."""
     label_path = display_path if display_path else image_path
     image_path_escaped = image_path.replace('\\', '\\\\').replace("'", "\\'")
     label_path_escaped = label_path.replace('\\', '\\\\').replace("'", "\\'")
@@ -110,9 +141,7 @@ def update_report(report_file, image_path, matched_classes, display_path=None):
     avg_score = round(sum(i['score'] for i in matched_classes) / len(matched_classes), 2) if matched_classes else 0
     clipboard_emoji = '\U0001F4CB'
 
-    with report_lock:
-        with open(report_file, 'a', encoding='utf-8') as f:
-            f.write(f"""
+    card = f"""
         <li>
             <a href="{image_path_escaped}" target="_blank">
                 <div class="zoom-container">
@@ -127,7 +156,13 @@ def update_report(report_file, image_path, matched_classes, display_path=None):
             <span class="clipboard-button" onclick="copyToClipboard('{label_path_escaped}')"><button>{clipboard_emoji}</button></span>
             </div>
         </li>
-""")
+"""
+    with report_lock:
+        with open(report_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        content = content.replace('</ul>', card + '</ul>', 1) if '</ul>' in content else content + card
+        with open(report_file, 'w', encoding='utf-8') as f:
+            f.write(content)
 
 
 def get_report_header(report_number):
@@ -314,7 +349,9 @@ def get_report_summary():
     <meta charset="UTF-8">
     <title>Scan Summary</title>
     <style>
-        body {{ background:#2e2c2c; color:#d4d0cd; font-family:system-ui,sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; gap:1rem; }}
+        body {{ background:#2e2c2c; color:#d4d0cd; font-family:system-ui,sans-serif;
+               display:flex; flex-direction:column; align-items:center;
+               justify-content:center; min-height:100vh; gap:1rem; }}
         h1 {{ font-size:2rem; color:#4f98a3; }}
         .stat {{ font-size:1.2rem; }}
         a {{ color:#4f98a3; }}
@@ -351,27 +388,28 @@ def log_error(n, message):
         f.write(f"{datetime.now()} - {message}\n")
 
 def clean_cache_directory(cache_dir, max_size_bytes):
+    """Evict oldest flat files in cache_dir. Skips subdirs (e.g. active zip_temp_* folders)."""
     try:
-        files = [
-            (os.path.join(cache_dir, fn), os.path.getmtime(os.path.join(cache_dir, fn)))
+        entries = [
+            os.path.join(cache_dir, fn)
             for fn in os.listdir(cache_dir)
             if os.path.isfile(os.path.join(cache_dir, fn))
         ]
-        current_size = sum(os.path.getsize(fp) for fp, _ in files)
+        current_size = sum(os.path.getsize(fp) for fp in entries)
         if current_size <= max_size_bytes:
             return
-        files.sort(key=lambda x: x[1])
-        for fp, _ in files:
+        entries.sort(key=os.path.getmtime)
+        for fp in entries:
             if current_size <= max_size_bytes:
                 break
             sz = os.path.getsize(fp)
-            os.remove(fp)
-            current_size -= sz
+            try:
+                os.remove(fp)
+                current_size -= sz
+            except Exception:
+                pass
     except Exception:
         pass
-
-def clear_console():
-    sys.stdout.write("\033[H\033[J")
 
 def is_complex_image(image_path):
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -384,17 +422,17 @@ def is_complex_image(image_path):
     return len(c_thresh) > 5 or len(c_edges) > 5
 
 # ---------------------------------------------------------------------------
-# Core scan logic (deduplicated)
+# Core scan logic
 # ---------------------------------------------------------------------------
 
-def scan_image(full_path, nude_detector, error_log_number, display_path=None):
+def scan_image(full_path, error_log_number):
     """
-    Scan a single image. Returns matched_classes list on detection, [] on no detection,
-    or None if the image should be skipped/errored.
+    Scan a single image using a per-thread NudeDetector.
+    Returns matched_classes on detection, [] on clean, None on error/skip.
     """
     sanitized = sanitize_filename(os.path.basename(full_path))
+    nude_detector = get_detector()
 
-    # Validate readable
     try:
         img = Image.open(full_path)
         img.close()
@@ -408,7 +446,6 @@ def scan_image(full_path, nude_detector, error_log_number, display_path=None):
             log_error(error_log_number, f"Cannot copy to cache {full_path}: {e2}")
             return None
 
-    # Complexity pre-check
     try:
         if not is_complex_image(full_path):
             return None
@@ -433,102 +470,148 @@ def scan_image(full_path, nude_detector, error_log_number, display_path=None):
     return matched if any(d['class'] in all_labels for d in matched) else []
 
 
-def handle_detection(matched_classes, full_path, report_number, images_with_detections, display_path=None):
-    """Write to report and update globals when a detection is confirmed."""
+def handle_detection(matched_classes, full_path, report_number_ref, images_with_detections, display_path=None):
+    """Thread-safe detection writer. report_number_ref is a list[int] mutable box."""
     global found, previous_report_number
-    found += 1
+
     label = display_path or full_path
-    images_with_detections.append(label)
     print(f"  [DETECTED] {os.path.basename(label)}")
 
     with report_lock:
-        current_size = os.path.getsize(get_report_filename(report_number))
-        if current_size >= 200 * 1024:
+        found += 1
+        images_with_detections.append(label)
+        report_number = report_number_ref[0]
+        if os.path.getsize(get_report_filename(report_number)) >= 200 * 1024:
             previous_report_number = report_number
             report_number += 1
+            report_number_ref[0] = report_number
             create_new_report(report_number)
         update_report(get_report_filename(report_number), full_path, matched_classes, display_path=display_path)
 
-    return report_number
-
 # ---------------------------------------------------------------------------
-# ZIP scanning
+# Archive scanning (.zip / .7z / .rar)
 # ---------------------------------------------------------------------------
 
-def scan_zip_file(zip_path, nude_detector, report_number, error_log_number, images_with_detections, extensions):
-    zip_uid = uuid.uuid4().hex
-    temp_dir = os.path.join('cache', f'zip_temp_{zip_uid}')
+def _extract_archive(archive_path, temp_dir, error_log_number):
+    """
+    Extract any supported archive type to temp_dir.
+    Returns True on success, False on failure.
+    """
+    lower = archive_path.lower()
+    try:
+        if lower.endswith('.zip'):
+            with zipfile.ZipFile(archive_path, 'r') as zf:
+                zf.extractall(temp_dir)
+        elif lower.endswith('.7z'):
+            if not HAS_7Z:
+                log_error(error_log_number, f"py7zr not installed, skipping {archive_path}")
+                return False
+            with py7zr.SevenZipFile(archive_path, mode='r') as sz:
+                sz.extractall(path=temp_dir)
+        elif lower.endswith('.rar'):
+            if not HAS_RAR:
+                log_error(error_log_number, f"rarfile not installed, skipping {archive_path}")
+                return False
+            with rarfile.RarFile(archive_path, 'r') as rf:
+                rf.extractall(temp_dir)
+        else:
+            return False
+        return True
+    except Exception as e:
+        log_error(error_log_number, f"Failed to extract {archive_path}: {e}")
+        return False
+
+
+def scan_archive(archive_path, report_number_ref, error_log_number, images_with_detections, extensions):
+    archive_uid = uuid.uuid4().hex
+    temp_dir = os.path.join('cache', f'arc_temp_{archive_uid}')
+    ext = os.path.splitext(archive_path)[1].upper()
 
     try:
         os.makedirs(temp_dir, exist_ok=True)
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall(temp_dir)
-        print(f"\n[ZIP] Scanning: {os.path.basename(zip_path)}")
+        if not _extract_archive(archive_path, temp_dir, error_log_number):
+            return
+        print(f"\n[{ext}] Scanning: {os.path.basename(archive_path)}")
     except Exception as e:
-        log_error(error_log_number, f"Failed to extract zip {zip_path}: {e}")
+        log_error(error_log_number, f"Archive setup error {archive_path}: {e}")
         shutil.rmtree(temp_dir, ignore_errors=True)
-        return report_number
+        return
 
     for root, _, inner_files in os.walk(temp_dir):
         for inner_file in inner_files:
+            if _shutdown.is_set():
+                break
             if not inner_file.lower().endswith(extensions):
                 continue
             full_path = os.path.join(root, inner_file)
-            display_path = f"{zip_path} >> {os.path.relpath(full_path, temp_dir)}"
-            matched = scan_image(full_path, nude_detector, error_log_number, display_path=display_path)
+            display_path = f"{archive_path} >> {os.path.relpath(full_path, temp_dir)}"
+            matched = scan_image(full_path, error_log_number)
             if matched:
-                report_number = handle_detection(matched, full_path, report_number, images_with_detections, display_path=display_path)
+                handle_detection(matched, full_path, report_number_ref, images_with_detections, display_path=display_path)
 
     shutil.rmtree(temp_dir, ignore_errors=True)
-    return report_number
 
 # ---------------------------------------------------------------------------
 # Directory scanning
 # ---------------------------------------------------------------------------
 
-def scan_directory(directory, report_number, error_log_number, extensions, exclude_dirs, resume=False, workers=1):
-    global previous_report_number
+ARCHIVE_EXTENSIONS = ('.zip',)
+if HAS_7Z:  _ARCHIVE_EXTS_7Z  = ('.7z',)
+else:        _ARCHIVE_EXTS_7Z  = ()
+if HAS_RAR: _ARCHIVE_EXTS_RAR = ('.rar',)
+else:        _ARCHIVE_EXTS_RAR = ()
+ALL_ARCHIVE_EXTENSIONS = ARCHIVE_EXTENSIONS + _ARCHIVE_EXTS_7Z + _ARCHIVE_EXTS_RAR
 
+
+def scan_directory(directory, report_number_ref, error_log_number, extensions, exclude_dirs, resume=False, workers=1):
     images_with_detections = []
-    nude_detector = NudeDetector()
 
     create_error_log_directory()
     create_new_error_log(error_log_number)
     create_cache_directory()
 
-    max_cache_size_bytes = 15 * 1024 * 1024
+    max_cache_bytes = 15 * 1024 * 1024
     scanned_paths = load_checkpoint() if resume else set()
 
     for subdir, dirs, files in os.walk(directory):
-        # Exclude specified directories in-place
+        if _shutdown.is_set():
+            break
+
         dirs[:] = [d for d in dirs if d not in exclude_dirs]
 
-        clear_console()
-        print(f"Scanning: {subdir}  ({len(files)} files)")
-        pbar = tqdm(total=len(files), position=0, leave=True, dynamic_ncols=True, unit='files')
+        pbar = tqdm(
+            total=len(files),
+            desc=subdir[-60:],
+            position=0,
+            leave=False,
+            dynamic_ncols=True,
+            unit='files'
+        )
 
         def process_file(file):
-            nonlocal report_number
+            if _shutdown.is_set():
+                return
             full_path = os.path.abspath(os.path.join(subdir, file))
 
             if resume and full_path in scanned_paths:
                 pbar.update(1)
                 return
 
-            if file.lower().endswith('.zip'):
-                pbar.set_postfix(current_file=f'[ZIP] {file}')
-                report_number = scan_zip_file(full_path, nude_detector, report_number, error_log_number, images_with_detections, extensions)
-            elif file.lower().endswith(extensions):
-                matched = scan_image(full_path, nude_detector, error_log_number)
+            fname_lower = file.lower()
+            if fname_lower.endswith(ALL_ARCHIVE_EXTENSIONS):
+                pbar.set_postfix(f=f'[ARC] {file[:35]}')
+                scan_archive(full_path, report_number_ref, error_log_number, images_with_detections, extensions)
+            elif fname_lower.endswith(extensions):
+                matched = scan_image(full_path, error_log_number)
                 if matched:
-                    report_number = handle_detection(matched, full_path, report_number, images_with_detections)
-                pbar.set_postfix(current_file=file[:40])
+                    handle_detection(matched, full_path, report_number_ref, images_with_detections)
+                pbar.set_postfix(f=file[:40])
 
             if resume:
                 scanned_paths.add(full_path)
                 save_checkpoint(scanned_paths)
 
-            clean_cache_directory('cache', max_cache_size_bytes)
+            clean_cache_directory('cache', max_cache_bytes)
             pbar.update(1)
 
         if workers > 1:
@@ -542,8 +625,9 @@ def scan_directory(directory, report_number, error_log_number, extensions, exclu
 
         pbar.close()
 
-    create_new_report(report_number, summary=True)
-    clear_checkpoint()
+    create_new_report(report_number_ref[0], summary=True)
+    if not _shutdown.is_set():
+        clear_checkpoint()
     return images_with_detections
 
 # ---------------------------------------------------------------------------
@@ -551,7 +635,7 @@ def scan_directory(directory, report_number, error_log_number, extensions, exclu
 # ---------------------------------------------------------------------------
 
 def main():
-    global default_detection_score
+    global default_detection_score, output_dir
 
     parser = argparse.ArgumentParser(
         description='Offline NSFW image scanner using NudeNet.',
@@ -562,54 +646,80 @@ Examples:
   python script.py D:/ --minscore 0.7
   python script.py C:/ --exclude Windows --exclude "Program Files" --workers 4
   python script.py C:/ --extensions .jpg .jpeg .png --resume
+  python script.py D:/ --output D:/scan_results
+
+Archive support:
+  .zip  built-in
+  .7z   requires: pip install py7zr
+  .rar  requires: pip install rarfile  (+ WinRAR/unrar binary in PATH)
 """
     )
-    parser.add_argument('directory', type=str, help='Directory or drive to scan')
-    parser.add_argument('--minscore', type=float, default=0.6,
+    parser.add_argument('directory',    type=str,           help='Directory or drive to scan')
+    parser.add_argument('--minscore',   type=float, default=0.6,
                         help='Minimum detection confidence (0-1), default: 0.6')
-    parser.add_argument('--exclude', action='append', default=[],
-                        help='Directory names to skip (can be used multiple times)')
+    parser.add_argument('--exclude',    action='append', default=[],
+                        help='Directory names to skip (repeatable)')
     parser.add_argument('--extensions', nargs='+', default=list(DEFAULT_EXTENSIONS),
                         help=f'Image extensions to scan (default: {" ".join(DEFAULT_EXTENSIONS)})')
-    parser.add_argument('--workers', type=int, default=1,
-                        help='Number of parallel scan workers (default: 1, use 2-4 for speed)')
-    parser.add_argument('--resume', action='store_true',
-                        help='Resume a previously interrupted scan using checkpoint file')
+    parser.add_argument('--workers',    type=int, default=1,
+                        help='Parallel scan workers (default: 1, try 2-4 for speed)')
+    parser.add_argument('--resume',     action='store_true',
+                        help='Resume interrupted scan from checkpoint')
+    parser.add_argument('--output',     type=str, default='reports',
+                        help='Directory to write reports into (default: reports/)')
 
     args = parser.parse_args()
     default_detection_score = args.minscore
+    output_dir = args.output
 
     extensions = tuple(e if e.startswith('.') else f'.{e}' for e in args.extensions)
 
-    create_reports_directory()
-    report_number = 1
-    create_new_report(report_number)
+    def _sigint_handler(sig, frame):
+        print("\n\n[!] Interrupted — saving checkpoint for --resume...")
+        _shutdown.set()
+    signal.signal(signal.SIGINT, _sigint_handler)
 
-    print(f"\nScanning: {args.directory}")
-    print(f"  Min score : {args.minscore}")
-    print(f"  Extensions: {', '.join(extensions)}")
-    print(f"  Workers   : {args.workers}")
+    os.makedirs(output_dir, exist_ok=True)
+    create_reports_directory()
+    report_number_ref = [1]
+    create_new_report(report_number_ref[0])
+
+    archive_support = ['.zip']
+    if HAS_7Z:  archive_support.append('.7z')
+    if HAS_RAR: archive_support.append('.rar')
+
+    print(f"\nScanning : {args.directory}")
+    print(f"Min score: {args.minscore}")
+    print(f"Exts     : {', '.join(extensions)}")
+    print(f"Archives : {', '.join(archive_support)}")
+    print(f"Workers  : {args.workers}")
+    print(f"Output   : {output_dir}")
     if args.exclude:
-        print(f"  Excluding : {', '.join(args.exclude)}")
+        print(f"Excluding: {', '.join(args.exclude)}")
     if args.resume:
-        print(f"  Resuming from checkpoint: {CHECKPOINT_FILE}")
+        print(f"Resuming from checkpoint: {CHECKPOINT_FILE}")
+    if not HAS_7Z:
+        print("  [!] .7z support disabled — install py7zr: pip install py7zr")
+    if not HAS_RAR:
+        print("  [!] .rar support disabled — install rarfile: pip install rarfile")
     print()
 
-    detections = scan_directory(
-        args.directory,
-        report_number,
-        error_log_number=1,
-        extensions=extensions,
-        exclude_dirs=set(args.exclude),
-        resume=args.resume,
-        workers=args.workers,
-    )
+    try:
+        detections = scan_directory(
+            args.directory,
+            report_number_ref,
+            error_log_number=1,
+            extensions=extensions,
+            exclude_dirs=set(args.exclude),
+            resume=args.resume,
+            workers=args.workers,
+        )
+    except Exception as e:
+        print(f"\n[ERROR] Unexpected failure: {e}")
+        detections = []
 
-    if detections:
-        print(f"\nDone. {len(detections)} detection(s) — reports saved to 'reports/'")
-    else:
-        print("\nDone. No detections found.")
-
+    status = "interrupted" if _shutdown.is_set() else "complete"
+    print(f"\nScan {status}. {len(detections)} detection(s) — reports in '{output_dir}/'")
     print(f"FOUND: {found}")
 
 if __name__ == "__main__":
