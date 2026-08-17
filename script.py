@@ -1,5 +1,8 @@
 import os
 import argparse
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 from nudenet import NudeDetector
 from tqdm import tqdm
@@ -11,6 +14,12 @@ import uuid
 import cv2
 import zipfile
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+DEFAULT_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff')
+
 all_labels = [
     "BUTTOCKS_EXPOSED",
     "FEMALE_BREAST_EXPOSED",
@@ -21,421 +30,432 @@ all_labels = [
     "MALE_GENITALIA_EXPOSED",
 ]
 
+# ---------------------------------------------------------------------------
+# Global state (protected by a lock for thread safety)
+# ---------------------------------------------------------------------------
+
 found = 0
-
 default_detection_score = 0.6
+previous_report_number = None
+report_lock = threading.Lock()
+state_lock = threading.Lock()
 
-previous_report_number = None  # Initialize the previous report number
+# ---------------------------------------------------------------------------
+# Cache / Directory helpers
+# ---------------------------------------------------------------------------
 
 def create_cache_directory():
-    cache_dir = 'cache'
-    if not os.path.exists(cache_dir):
-        os.makedirs(cache_dir)
+    os.makedirs('cache', exist_ok=True)
 
 def get_cache_filename(filename):
     return os.path.join('cache', filename)
 
 def create_reports_directory():
-    current_datetime = datetime.now()
-    formatted_date = current_datetime.strftime("%d%m%Y_%H%M")
+    formatted_date = datetime.now().strftime("%d%m%Y_%H%M")
     reports_dir = os.path.join("reports", f"reports_{formatted_date}")
+    os.makedirs(reports_dir, exist_ok=True)
 
-    if not os.path.exists(reports_dir):
-        os.makedirs(reports_dir)
-        
 def get_latest_report_directory():
-    # Get a list of all directories in the "reports" subdirectory that match the "reports_*" pattern
-    report_directories = [d for d in glob.glob('reports/reports_*') if os.path.isdir(d)]
+    dirs = sorted(d for d in glob.glob(os.path.join('reports', 'reports_*')) if os.path.isdir(d))
+    return dirs[-1] if dirs else None
 
-    # Sort the directories by name (which includes the date and time)
-    report_directories.sort()
+def get_report_filename(report_number, local=False):
+    if local:
+        return f'nudenet_report_{report_number}.html'
+    latest = get_latest_report_directory()
+    if latest:
+        return os.path.join(latest, f'nudenet_report_{report_number}.html')
+    return os.path.join('reports', f'nudenet_report_{report_number}.html')
 
-    # Get the latest directory (which will be the last one after sorting)
-    latest_directory = report_directories[-1] if report_directories else None
+# ---------------------------------------------------------------------------
+# Scan state / resume support
+# ---------------------------------------------------------------------------
 
-    return latest_directory
+CHECKPOINT_FILE = 'scan_checkpoint.json'
 
-def get_report_filename(report_number, local = False):
-    if local == True:
-        report_filename = f'nudenet_report_{report_number}.html'
-        return report_filename
-    # Get the latest report directory
-    latest_directory = get_latest_report_directory()
+def load_checkpoint():
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'r', encoding='utf-8') as f:
+            return set(json.load(f).get('scanned', []))
+    return set()
 
-    if latest_directory:
-        # Extract the date and time portion from the directory name
-        date_time_part = latest_directory.replace('reports\\reports_', '')
+def save_checkpoint(scanned_paths):
+    with state_lock:
+        with open(CHECKPOINT_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'scanned': list(scanned_paths)}, f)
 
-        # Format it into a datetime object
-        report_datetime = datetime.strptime(date_time_part, "%d%m%Y_%H%M")
+def clear_checkpoint():
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
 
-        # Format the report filename using the latest directory's date and time
-        report_filename = f'{latest_directory}/nudenet_report_{report_number}.html'
-
-        return report_filename
-
-    # Return a default path if there are no report directories
-    return f'reports/nudenet_report_{report_number}.html'
+# ---------------------------------------------------------------------------
+# Report helpers
+# ---------------------------------------------------------------------------
 
 def create_new_report(report_number, summary=False):
     report_file = get_report_filename(report_number)
-    if not os.path.exists(report_file):  # Check if the file does not exist, create it
-        with open(report_file, 'w') as report:
-            if summary:
-                report.write(get_report_summary())
-            else:
-                report.write(get_report_header(report_number))
+    if not os.path.exists(report_file):
+        with open(report_file, 'w', encoding='utf-8') as f:
+            f.write(get_report_summary() if summary else get_report_header(report_number))
     else:
-        print(f"Report file already exists: {report_file}")  # Debug print
-
-    
+        print(f"Report file already exists: {report_file}")
 
 
 def update_report(report_file, image_path, matched_classes, display_path=None):
-    # Use display_path for labels if provided (e.g. for zip entries), otherwise use image_path
     label_path = display_path if display_path else image_path
-    # Replace single backslashes with double backslashes
-    image_path_escaped = image_path.replace('\\', '\\\\')
-    label_path_escaped = label_path.replace('\\', '\\\\')
-    
-    # Get only the filename with extension
-    file_name_with_extension = os.path.basename(label_path)
-    matched_classes_str = ',<br>'.join([f"{item['class']} [{item['score']:.2f}]" for item in matched_classes])
-    match_scores_avg = round(sum(item['score'] for item in matched_classes) / len(matched_classes), 2) if matched_classes else 0
+    image_path_escaped = image_path.replace('\\', '\\\\').replace("'", "\\'")
+    label_path_escaped = label_path.replace('\\', '\\\\').replace("'", "\\'")
+    file_name = os.path.basename(label_path)
+    matched_str = ',<br>'.join(f"{i['class']} [{i['score']:.2f}]" for i in matched_classes)
+    avg_score = round(sum(i['score'] for i in matched_classes) / len(matched_classes), 2) if matched_classes else 0
+    clipboard_emoji = '\U0001F4CB'
 
-    clipboard_emoji = '\U0001F4CB'  # Unicode code point for clipboard emoji
-
-    with open(report_file, 'a', encoding='utf-8') as report:
-        report.write(f"""
+    with report_lock:
+        with open(report_file, 'a', encoding='utf-8') as f:
+            f.write(f"""
         <li>
             <a href="{image_path_escaped}" target="_blank">
                 <div class="zoom-container">
-                    <img src='{image_path_escaped}' alt='Image'>
+                    <img src='{image_path_escaped}' alt='Detected image' loading="lazy">
                 </div>
             </a>
             <br>
             <div class="file-info">
-            <span class="file-path-label" onclick="copyToClipboard('{label_path_escaped}')">{file_name_with_extension}</span>
-            <span class="file-description" onclick="copyToClipboard('{label_path_escaped}')">Matched Classes:<br>{matched_classes_str}<br></span>
-            <span class="average-scores" onclick="copyToClipboard('{label_path_escaped}')">[avg: {match_scores_avg}]</span>
-            <span class="clipboard-button" onclick="copyToClipboard('{label_path_escaped}')"><Button>{clipboard_emoji}</Button></span>
+            <span class="file-path-label" onclick="copyToClipboard('{label_path_escaped}')" title="{label_path_escaped}">{file_name}</span>
+            <span class="file-description">Matched Classes:<br>{matched_str}<br></span>
+            <span class="average-scores">[avg: {avg_score}]</span>
+            <span class="clipboard-button" onclick="copyToClipboard('{label_path_escaped}')"><button>{clipboard_emoji}</button></span>
             </div>
         </li>
-        """)
+""")
 
 
 def get_report_header(report_number):
-    header = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>NudeNet Detection Report</title>
-            <style>
-                ul {{
-                    list-style: none;
-                    padding: 0;
-                    display: flex;
-                    flex-wrap: wrap;
-                    justify-content: center;
-                }}
-                li {{
-                    margin: 10px;
-                    text-align: center;
-                    display: flex;
-                    border: 1px dotted;
-                    border-radius: 20px;
-                    background-color: dimgrey;
-                }}
-                img, .file-path-label {{
-                    cursor: pointer;
-                    transition: transform 0.1s ease-in-out;
-                    font-weight: 600;
-                    word-wrap: break-word;
-                    margin-bottom: 0.7rem;
-                }}
-                img {{
-                    width: 150px;
-                    height: 150px;
-                    filter: blur(20px);
-                    cursor: pointer;
-                    transition: transform 0.2s;
-                }}
-                img:hover {{
-                    transform: scale(2);
-                }}
-                .file-info {{
-                    width: 300px;
-                    display: flex;
-                    flex-direction: column;
-                    justify-content: space-between;
-                }}
-                .clicked {{
-                    transform: scale(0.95);
-                }}
-                .zoom-container {{
-                    position: relative;
-                    width: 150px;
-                    height: 150px;
-                    overflow: hidden;
-                    border-radius: 25px;
-                }}
-                .zoom-container img {{
-                    width: 100%;
-                    height: auto;
-                    transition: transform 0.2s;
-                    filter: blur(20px);
-                    border-radius: 25px;
-                }}
-                .zoom-container img.unblurred:hover {{
-                    transform: scale(2);
-                    overflow: auto;
-                }}
-                .average-scores {{
-                    font-size: small;
-                }}
-                .clipboard-button {{
-                    margin-top: 0.5rem;
-                }}
-                .clipboard-button Button {{   
-                    background-color: darkslategrey;
-                }}
-                 body {{
-                    display: flex;
-                    flex-wrap: wrap;
-                    justify-content: center;
-                    overflow: auto;  /* Make sure this is not set to 'hidden' */
-                    background-color: #4d4a4a;
-                }}
-
-                .controls {{
-                    display: flex;
-                    width: 100%;
-                    justify-content: center;
-                    flex-direction: column;
-                    background-color: #213636;
-                    position: sticky;
-                    top: 0;  /* Specify a top value for sticky positioning */
-                    z-index: 999;
-                    padding: 0.3rem;
-                }}
-                .blurcontrols{{              
-                    display: flex;
-                    justify-content: center;
-                }}
-                .report-navigation{{                  
-                    display: flex;
-                    justify-content: center;
-                }}
-            </style>
-            <script>
-                function copyToClipboard(text) {{
-                    const textArea = document.createElement("textarea");
-                    textArea.value = text;
-                    document.body.appendChild(textArea);
-                    textArea.select();
-                    document.execCommand('copy');
-                    document.body.removeChild(textArea);
-                }}
-                function toggleBlur() {{
-                    const images = document.querySelectorAll('.zoom-container img');
-                    const blurCheckbox = document.getElementById('blurCheckbox');
-                    const blurValue = blurCheckbox.checked ? 'blur(20px)' : 'none';
-                    images.forEach(img => {{
-                        img.style.filter = blurValue;
-                        if (blurValue === 'none') {{
-                            img.classList.add('unblurred');
-                        }} else {{
-                            img.classList.remove('unblurred');
-                        }}
-                    }});
-                }}
-                function animateClick(event) {{
-                    const element = event.target;
-                    element.classList.add('clicked');
-                    setTimeout(() => element.classList.remove('clicked'), 100);
-                }}
-            </script>
-        </head>
-        <body>
-        <div class="controls">
-        <div class="blurcontrols">
-            <label for="blurCheckbox">Blur Images</label>
-            <input type="checkbox" id="blurCheckbox" checked onchange="toggleBlur()">
-        </div>
-        <div class="report-navigation">
-    """
-    
+    prev_link = ''
+    next_link = ''
     if previous_report_number:
-        header += f'<a class="report-previous" href="{get_report_filename(previous_report_number, True)}">Previous Report</a>&nbsp;&nbsp;|'
-        
+        prev_link = f'<a class="report-previous" href="{get_report_filename(previous_report_number, True)}">&#8592; Previous</a>&nbsp;&nbsp;|'
     if report_number > 0:
-        header += f'&nbsp;&nbsp;&nbsp;&nbsp;<a class="report-next" href="{get_report_filename(report_number + 1, True)}">Next Report</a>'
+        next_link = f'&nbsp;&nbsp;<a class="report-next" href="{get_report_filename(report_number + 1, True)}">Next &#8594;</a>'
 
-    header += f"""
-        </div>
-        </div>
-            <ul onclick="animateClick(event)">
-        </body>
-        </html>
-    """
-    
-    return header
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NudeNet Detection Report #{report_number}</title>
+    <style>
+        :root {{
+            --bg: #2e2c2c;
+            --surface: #3d3b3b;
+            --header-bg: #1a2e2e;
+            --accent: #4f98a3;
+            --text: #d4d0cd;
+            --text-muted: #8a8785;
+            --radius: 14px;
+        }}
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{
+            background: var(--bg);
+            color: var(--text);
+            font-family: system-ui, sans-serif;
+            font-size: 14px;
+            min-height: 100vh;
+        }}
+        .controls {{
+            position: sticky;
+            top: 0;
+            z-index: 999;
+            background: var(--header-bg);
+            padding: 0.6rem 1rem;
+            display: flex;
+            align-items: center;
+            gap: 1.5rem;
+            flex-wrap: wrap;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+        }}
+        .controls label {{ display: flex; align-items: center; gap: 0.4rem; cursor: pointer; }}
+        .report-navigation {{ margin-left: auto; display: flex; gap: 0.5rem; }}
+        .report-navigation a {{
+            color: var(--accent);
+            text-decoration: none;
+            padding: 0.25rem 0.6rem;
+            border: 1px solid var(--accent);
+            border-radius: 6px;
+            font-size: 13px;
+            transition: background 0.15s;
+        }}
+        .report-navigation a:hover {{ background: rgba(79,152,163,0.15); }}
+        ul {{
+            list-style: none;
+            padding: 1rem;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            justify-content: center;
+        }}
+        li {{
+            background: var(--surface);
+            border-radius: var(--radius);
+            border: 1px solid rgba(255,255,255,0.07);
+            display: flex;
+            overflow: hidden;
+            transition: box-shadow 0.2s;
+            max-width: 460px;
+        }}
+        li:hover {{ box-shadow: 0 4px 20px rgba(0,0,0,0.4); }}
+        .zoom-container {{
+            width: 150px;
+            height: 150px;
+            flex-shrink: 0;
+            overflow: hidden;
+        }}
+        .zoom-container img {{
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            filter: blur(20px);
+            transition: filter 0.2s, transform 0.2s;
+            cursor: pointer;
+        }}
+        .zoom-container img.unblurred {{ filter: none; }}
+        .zoom-container img:hover {{ transform: scale(1.05); }}
+        .file-info {{
+            padding: 0.75rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+            min-width: 0;
+            flex: 1;
+        }}
+        .file-path-label {{
+            font-weight: 600;
+            word-break: break-all;
+            font-size: 13px;
+            cursor: pointer;
+            color: var(--accent);
+        }}
+        .file-path-label:hover {{ text-decoration: underline; }}
+        .file-description {{ font-size: 12px; color: var(--text-muted); line-height: 1.5; }}
+        .average-scores {{ font-size: 12px; color: var(--text-muted); }}
+        .clipboard-button button {{
+            background: rgba(79,152,163,0.15);
+            border: 1px solid rgba(79,152,163,0.3);
+            border-radius: 6px;
+            padding: 0.2rem 0.5rem;
+            cursor: pointer;
+            color: var(--text);
+            font-size: 14px;
+            transition: background 0.15s;
+        }}
+        .clipboard-button button:hover {{ background: rgba(79,152,163,0.3); }}
+        .toast {{
+            position: fixed;
+            bottom: 1.5rem;
+            left: 50%;
+            transform: translateX(-50%) translateY(20px);
+            background: var(--accent);
+            color: #fff;
+            padding: 0.5rem 1.2rem;
+            border-radius: 999px;
+            font-size: 13px;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s, transform 0.2s;
+            z-index: 9999;
+        }}
+        .toast.show {{ opacity: 1; transform: translateX(-50%) translateY(0); }}
+    </style>
+    <script>
+        function copyToClipboard(text) {{
+            navigator.clipboard.writeText(text).then(() => showToast('Path copied!')).catch(() => {{
+                const ta = document.createElement('textarea');
+                ta.value = text; document.body.appendChild(ta); ta.select();
+                document.execCommand('copy'); document.body.removeChild(ta);
+                showToast('Path copied!');
+            }});
+        }}
+        function showToast(msg) {{
+            const t = document.getElementById('toast');
+            t.textContent = msg; t.classList.add('show');
+            setTimeout(() => t.classList.remove('show'), 2000);
+        }}
+        function toggleBlur() {{
+            const checked = document.getElementById('blurCheckbox').checked;
+            document.querySelectorAll('.zoom-container img').forEach(img => {{
+                img.classList.toggle('unblurred', !checked);
+            }});
+        }}
+    </script>
+</head>
+<body>
+<div class="controls">
+    <label><input type="checkbox" id="blurCheckbox" checked onchange="toggleBlur()"> Blur images</label>
+    <span style="color:var(--text-muted);font-size:12px;">Click image to open full size &bull; Click filename to copy path</span>
+    <div class="report-navigation">{prev_link}{next_link}</div>
+</div>
+<ul>
+<!-- detections appended below -->
+</ul>
+<div class="toast" id="toast"></div>
+</body>
+</html>
+"""
+
 
 def get_report_summary():
-    content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>NudeNet Detection Report</title>
-            <style>
-                    body {{
-                    display: flex;
-                    flex-wrap: wrap;
-                    justify-content: center;
-                    overflow: auto;  /* Make sure this is not set to 'hidden' */
-                    background-color: #4d4a4a;
-                }}
-
-                .controls {{
-                    display: flex;
-                    width: 100%;
-                    justify-content: center;
-                    flex-direction: column;
-                    background-color: #213636;
-                    position: sticky;
-                    top: 0;  /* Specify a top value for sticky positioning */
-                    z-index: 999;
-                    padding: 0.3rem;
-                }}
-
-                .report-navigation{{                  
-                    display: flex;
-                    justify-content: center;
-                }}
-                .summary-info{{
-                    margin-top: 3rem;
-                }}
-                .summary-line{{
-                    display:flex;
-                }}
-                .title{{
-                    margin-bottom: 2rem;
-                }}
-            </style>
-        </head>
-        <body>
-        <div class="controls">
-        <div class="report-navigation">
-    """
-    
+    prev_link = ''
     if previous_report_number:
-        content += f'<a class="report-previous" href="{get_report_filename(previous_report_number, True)}">Previous Report</a>'
-      
-    content += f"""
-        </div>
-        </div>
-            <div class="summary-info">
-                <div class="title">
-                ANALYSIS
-                </div>
-            <div class="summary-line">
-            <div class="label">Found: </div>
-            <div class="result">{str(found)}</div>
-            </div>
-            </div>
-        </body>
-        </html>
-    """
-    
-    return content
+        prev_link = f'<a href="{get_report_filename(previous_report_number, True)}">&#8592; Previous Report</a>'
 
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Scan Summary</title>
+    <style>
+        body {{ background:#2e2c2c; color:#d4d0cd; font-family:system-ui,sans-serif; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; gap:1rem; }}
+        h1 {{ font-size:2rem; color:#4f98a3; }}
+        .stat {{ font-size:1.2rem; }}
+        a {{ color:#4f98a3; }}
+    </style>
+</head>
+<body>
+    <h1>Scan Complete</h1>
+    <div class="stat">Total detections: <strong>{found}</strong></div>
+    <div>{prev_link}</div>
+</body>
+</html>
+"""
 
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def sanitize_filename(filename):
-    # Extract the file extension from the original filename
-    _, file_extension = os.path.splitext(filename)
-
-    # Generate a simple UID as the filename without dashes
-    uid = str(uuid.uuid4().hex).replace('-', '')
-
-    # Append the original file extension to the UID
-    sanitized_filename = uid + file_extension
-    return sanitized_filename
+    _, ext = os.path.splitext(filename)
+    return uuid.uuid4().hex + ext
 
 def create_error_log_directory():
-    error_log_dir = 'logs/error_logs'
-    if not os.path.exists(error_log_dir):
-        os.makedirs(error_log_dir)
+    os.makedirs(os.path.join('logs', 'error_logs'), exist_ok=True)
 
-def get_error_log_filename(error_log_number):
-    return f'logs/error_logs/error_log_{error_log_number}.txt'
+def get_error_log_filename(n):
+    return os.path.join('logs', 'error_logs', f'error_log_{n}.txt')
 
-def create_new_error_log(error_log_number):
-    error_log_file = get_error_log_filename(error_log_number)
-    with open(error_log_file, 'w') as error_log:
-        error_log.write("Error Log:\n")
+def create_new_error_log(n):
+    with open(get_error_log_filename(n), 'w', encoding='utf-8') as f:
+        f.write("Error Log:\n")
 
-
-def log_error(error_log_number, message):
-    error_log_file = get_error_log_filename(error_log_number)
-    with open(error_log_file, 'a', encoding='utf-8') as error_log:
-        error_log.write(f"{datetime.now()} - {message}\n")
-
+def log_error(n, message):
+    with open(get_error_log_filename(n), 'a', encoding='utf-8') as f:
+        f.write(f"{datetime.now()} - {message}\n")
 
 def clean_cache_directory(cache_dir, max_size_bytes):
-    # Get the current size of the cache directory
-    current_size = sum(os.path.getsize(os.path.join(cache_dir, f)) for f in os.listdir(cache_dir) if os.path.isfile(os.path.join(cache_dir, f)))
-
-    # Check if the current size exceeds the maximum allowed size
-    if current_size > max_size_bytes:
-        # List all files in the cache directory and sort them by modification time
-        files = [(os.path.join(cache_dir, f), os.path.getmtime(os.path.join(cache_dir, f))) for f in os.listdir(cache_dir) if os.path.isfile(os.path.join(cache_dir, f))]
-        files.sort(key=lambda x: x[1])  # Sort by modification time (oldest first)
-
-        # Calculate the amount of space to free up
-        space_to_free = current_size - max_size_bytes
-
-        # Iterate through the files and delete the oldest ones until enough space is freed
-        for file_path, _ in files:
+    try:
+        files = [
+            (os.path.join(cache_dir, fn), os.path.getmtime(os.path.join(cache_dir, fn)))
+            for fn in os.listdir(cache_dir)
+            if os.path.isfile(os.path.join(cache_dir, fn))
+        ]
+        current_size = sum(os.path.getsize(fp) for fp, _ in files)
+        if current_size <= max_size_bytes:
+            return
+        files.sort(key=lambda x: x[1])
+        for fp, _ in files:
             if current_size <= max_size_bytes:
                 break
-            file_size = os.path.getsize(file_path)
-            os.remove(file_path)
-            current_size -= file_size
-
+            sz = os.path.getsize(fp)
+            os.remove(fp)
+            current_size -= sz
+    except Exception:
+        pass
 
 def clear_console():
-    sys.stdout.write("\033[H\033[J")  # ANSI escape code to clear the screen
-
+    sys.stdout.write("\033[H\033[J")
 
 def is_complex_image(image_path):
-    # Load the image
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if image is None:
-        raise ValueError(f"Failed to load image from path: {image_path}")
-
-    # Apply binary thresholding
+        raise ValueError(f"Failed to load image: {image_path}")
     _, thresh = cv2.threshold(image, 100, 255, cv2.THRESH_BINARY)
-
-    # Find contours in the thresholded image
-    contours_thresh, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Apply Canny edge detection
+    c_thresh, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     edges = cv2.Canny(image, 100, 200)
+    c_edges, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return len(c_thresh) > 5 or len(c_edges) > 5
 
-    # Find contours in the edge-detected image
-    contours_edges, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # Assuming a threshold of 5 contours to distinguish between simple and complex images
-    return len(contours_thresh) > 5 or len(contours_edges) > 5
+# ---------------------------------------------------------------------------
+# Core scan logic (deduplicated)
+# ---------------------------------------------------------------------------
+
+def scan_image(full_path, nude_detector, error_log_number, display_path=None):
+    """
+    Scan a single image. Returns matched_classes list on detection, [] on no detection,
+    or None if the image should be skipped/errored.
+    """
+    sanitized = sanitize_filename(os.path.basename(full_path))
+
+    # Validate readable
+    try:
+        img = Image.open(full_path)
+        img.close()
+    except Exception as e:
+        log_error(error_log_number, f"Cannot open {full_path}: {e}")
+        temp_path = get_cache_filename(sanitized)
+        try:
+            shutil.copyfile(full_path, temp_path)
+            full_path = temp_path
+        except Exception as e2:
+            log_error(error_log_number, f"Cannot copy to cache {full_path}: {e2}")
+            return None
+
+    # Complexity pre-check
+    try:
+        if not is_complex_image(full_path):
+            return None
+        detections = nude_detector.detect(full_path)
+    except Exception as e:
+        log_error(error_log_number, f"Detection error {full_path}: {e}")
+        temp_path = get_cache_filename(sanitized)
+        try:
+            shutil.copyfile(full_path, temp_path)
+            if not is_complex_image(temp_path):
+                return None
+            detections = nude_detector.detect(temp_path)
+        except Exception as e2:
+            log_error(error_log_number, f"Cached detection error {full_path}: {e2}")
+            return None
+
+    matched = [
+        {'class': d['class'], 'score': d['score']}
+        for d in detections
+        if d['class'] in all_labels and d.get('score', 0) > default_detection_score
+    ]
+    return matched if any(d['class'] in all_labels for d in matched) else []
 
 
-def scan_zip_file(zip_path, nude_detector, report_number, error_log_number, images_with_detections):
-    """Extract a zip file to a temp cache folder, scan all images inside, then clean up."""
-    global previous_report_number
-    global found
+def handle_detection(matched_classes, full_path, report_number, images_with_detections, display_path=None):
+    """Write to report and update globals when a detection is confirmed."""
+    global found, previous_report_number
+    found += 1
+    label = display_path or full_path
+    images_with_detections.append(label)
+    print(f"  [DETECTED] {os.path.basename(label)}")
 
+    with report_lock:
+        current_size = os.path.getsize(get_report_filename(report_number))
+        if current_size >= 200 * 1024:
+            previous_report_number = report_number
+            report_number += 1
+            create_new_report(report_number)
+        update_report(get_report_filename(report_number), full_path, matched_classes, display_path=display_path)
+
+    return report_number
+
+# ---------------------------------------------------------------------------
+# ZIP scanning
+# ---------------------------------------------------------------------------
+
+def scan_zip_file(zip_path, nude_detector, report_number, error_log_number, images_with_detections, extensions):
     zip_uid = uuid.uuid4().hex
     temp_dir = os.path.join('cache', f'zip_temp_{zip_uid}')
 
@@ -443,65 +463,32 @@ def scan_zip_file(zip_path, nude_detector, report_number, error_log_number, imag
         os.makedirs(temp_dir, exist_ok=True)
         with zipfile.ZipFile(zip_path, 'r') as zf:
             zf.extractall(temp_dir)
-        print(f"Scanning zip: {os.path.basename(zip_path)}")
+        print(f"\n[ZIP] Scanning: {os.path.basename(zip_path)}")
     except Exception as e:
-        log_error(error_log_number, f"Failed to extract zip {zip_path}: {str(e)}")
+        log_error(error_log_number, f"Failed to extract zip {zip_path}: {e}")
         shutil.rmtree(temp_dir, ignore_errors=True)
         return report_number
 
     for root, _, inner_files in os.walk(temp_dir):
         for inner_file in inner_files:
-            if not inner_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+            if not inner_file.lower().endswith(extensions):
                 continue
-
             full_path = os.path.join(root, inner_file)
-            # Label in report shows original zip path >> internal file path
             display_path = f"{zip_path} >> {os.path.relpath(full_path, temp_dir)}"
-
-            try:
-                img = Image.open(full_path)
-                img.close()
-            except Exception as e:
-                log_error(error_log_number, f"Error opening {full_path} from zip {zip_path}: {str(e)}")
-                continue
-
-            try:
-                if not is_complex_image(full_path):
-                    continue
-                detections = nude_detector.detect(full_path)
-            except Exception as e:
-                log_error(error_log_number, f"Error detecting nudity in {full_path} from zip {zip_path}: {str(e)}")
-                continue
-
-            matched_classes = [
-                {'class': item['class'], 'score': item['score']}
-                for item in detections
-                if item['class'] in all_labels and item.get('score', 0) > default_detection_score
-            ]
-
-            detected = any(item['class'] in all_labels for item in matched_classes)
-
-            if detected:
-                found += 1
-                images_with_detections.append(display_path)
-                print(f"Detected inside zip: {display_path}")
-
-                current_report_size = os.path.getsize(get_report_filename(report_number))
-                if current_report_size >= 200 * 1024:
-                    previous_report_number = report_number
-                    report_number += 1
-                    create_new_report(report_number)
-
-                # Pass display_path so report labels show zip source, not temp path
-                update_report(get_report_filename(report_number), full_path, matched_classes, display_path=display_path)
+            matched = scan_image(full_path, nude_detector, error_log_number, display_path=display_path)
+            if matched:
+                report_number = handle_detection(matched, full_path, report_number, images_with_detections, display_path=display_path)
 
     shutil.rmtree(temp_dir, ignore_errors=True)
     return report_number
 
+# ---------------------------------------------------------------------------
+# Directory scanning
+# ---------------------------------------------------------------------------
 
-def scan_directory(directory, report_number, error_log_number):
+def scan_directory(directory, report_number, error_log_number, extensions, exclude_dirs, resume=False, workers=1):
     global previous_report_number
-    global found 
+
     images_with_detections = []
     nude_detector = NudeDetector()
 
@@ -510,137 +497,121 @@ def scan_directory(directory, report_number, error_log_number):
     create_cache_directory()
 
     max_cache_size_bytes = 15 * 1024 * 1024
+    scanned_paths = load_checkpoint() if resume else set()
 
-    for subdir, _, files in os.walk(directory):
+    for subdir, dirs, files in os.walk(directory):
+        # Exclude specified directories in-place
+        dirs[:] = [d for d in dirs if d not in exclude_dirs]
+
         clear_console()
-        # Calculate the total number of files in the current directory
-        total_files_in_directory = len(files)
+        print(f"Scanning: {subdir}  ({len(files)} files)")
+        pbar = tqdm(total=len(files), position=0, leave=True, dynamic_ncols=True, unit='files')
 
-        # Create a new progress bar for the current directory
-        pbar = tqdm(total=total_files_in_directory, position=0, leave=True, dynamic_ncols=True, unit='images')
-
-        for file in files:
-        
-            pbar.update(1)  # Update the progress bar for each processed image
-
+        def process_file(file):
+            nonlocal report_number
             full_path = os.path.abspath(os.path.join(subdir, file))
 
-            # --- ZIP SUPPORT ---
+            if resume and full_path in scanned_paths:
+                pbar.update(1)
+                return
+
             if file.lower().endswith('.zip'):
                 pbar.set_postfix(current_file=f'[ZIP] {file}')
-                report_number = scan_zip_file(full_path, nude_detector, report_number, error_log_number, images_with_detections)
-                clean_cache_directory('cache', max_cache_size_bytes)
-                continue
+                report_number = scan_zip_file(full_path, nude_detector, report_number, error_log_number, images_with_detections, extensions)
+            elif file.lower().endswith(extensions):
+                matched = scan_image(full_path, nude_detector, error_log_number)
+                if matched:
+                    report_number = handle_detection(matched, full_path, report_number, images_with_detections)
+                pbar.set_postfix(current_file=file[:40])
 
-            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                sanitized_filename = sanitize_filename(file)
+            if resume:
+                scanned_paths.add(full_path)
+                save_checkpoint(scanned_paths)
 
-                try:
-                    img = Image.open(full_path)
-                    img.close()
-                except (PermissionError, OSError, Exception) as e:
-                    error_message = f"Error while processing {full_path}: {str(e)}"
-                    print(error_message)
-                    log_error(error_log_number, error_message)
-                    temp_path = get_cache_filename(sanitized_filename)
-                    try:
-                        shutil.copyfile(full_path, temp_path)
-                        full_path = temp_path
-                    except Exception as e:
-                        error_message = f"Error while copying {full_path} to cache: {str(e)}"
-                        print(error_message)
-                        log_error(error_log_number, error_message)
-                        continue
+            clean_cache_directory('cache', max_cache_size_bytes)
+            pbar.update(1)
 
-                try:
-                    if not is_complex_image(full_path):
-                        continue
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(process_file, f): f for f in files}
+                for _ in as_completed(futures):
+                    pass
+        else:
+            for file in files:
+                process_file(file)
 
-                    detections = nude_detector.detect(full_path)
-                except Exception as e:
-                    cache_error_message = f"Error while detecting nudity in {full_path}: {str(e)}"
-                    log_error(error_log_number, cache_error_message)
-                    temp_path = get_cache_filename(sanitized_filename)
-                    try:
-                        shutil.copyfile(full_path, temp_path)
-                    except Exception as e:
-                        error_message = f"Error while copying {full_path} to cache: {str(e)}"
-                        print(error_message)
-                        log_error(error_log_number, error_message)
-                        continue
+        pbar.close()
 
-                    try:
-                        if not is_complex_image(temp_path):
-                            continue
-                        detections = nude_detector.detect(temp_path)
-                    except Exception as e:
-                        cache_error_message = f"Error while re-detecting nudity in cached {full_path}: {str(e)}"
-                        print(cache_error_message)
-                        log_error(error_log_number, cache_error_message)
-                        continue
-
-                matched_classes = [
-                    {'class': item['class'], 'score': item['score']}
-                    for item in detections
-                    if item['class'] in all_labels and item.get('score', 0) > default_detection_score
-                ]
-
-                detected = any(item['class'] in all_labels for item in matched_classes)
-
-
-
-                if detected:
-                    found += 1
-                    images_with_detections.append(full_path)
-                    print(f"Scanning directory {directory} for NSFW images...")
-                    print(f"Detected: {sanitized_filename}")
-
-                    current_report_size = os.path.getsize(get_report_filename(report_number))
-                    if current_report_size >= 200 * 1024:
-                        previous_report_number = report_number  # Update the previous report number
-                        report_number += 1                        
-                        create_new_report(report_number)
-                        
-
-
-                    update_report(get_report_filename(report_number), full_path, matched_classes)
-
-                pbar.set_postfix(current_file=f'{sanitized_filename}')
-
-                clean_cache_directory('cache', max_cache_size_bytes)
-
-        pbar.close()  # Close the progress bar for the current directory
-
-    create_new_report(report_number, True)
+    create_new_report(report_number, summary=True)
+    clear_checkpoint()
     return images_with_detections
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     global default_detection_score
-    parser = argparse.ArgumentParser(description='Scan a directory for nude images and generate an HTML report.')
-    parser.add_argument('directory', type=str, help='Directory to scan for images')
-    # Add an argument for the detection score
-    parser.add_argument('--minscore', type=float, default=0.6, help='Detection score threshold (between 0 and 1), use a decimal point, eg: 0.3, DEFAULT: 0.6')
+
+    parser = argparse.ArgumentParser(
+        description='Offline NSFW image scanner using NudeNet.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python script.py C:/Users/me/Pictures
+  python script.py D:/ --minscore 0.7
+  python script.py C:/ --exclude Windows --exclude "Program Files" --workers 4
+  python script.py C:/ --extensions .jpg .jpeg .png --resume
+"""
+    )
+    parser.add_argument('directory', type=str, help='Directory or drive to scan')
+    parser.add_argument('--minscore', type=float, default=0.6,
+                        help='Minimum detection confidence (0-1), default: 0.6')
+    parser.add_argument('--exclude', action='append', default=[],
+                        help='Directory names to skip (can be used multiple times)')
+    parser.add_argument('--extensions', nargs='+', default=list(DEFAULT_EXTENSIONS),
+                        help=f'Image extensions to scan (default: {" ".join(DEFAULT_EXTENSIONS)})')
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Number of parallel scan workers (default: 1, use 2-4 for speed)')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume a previously interrupted scan using checkpoint file')
 
     args = parser.parse_args()
+    default_detection_score = args.minscore
+
+    extensions = tuple(e if e.startswith('.') else f'.{e}' for e in args.extensions)
+
     create_reports_directory()
     report_number = 1
     create_new_report(report_number)
-    error_log_number = 1  # Initialize error log number
-    
-    
-    default_detection_score = args.minscore
 
-    print(f"Scanning directory {args.directory} for nude images...")
+    print(f"\nScanning: {args.directory}")
+    print(f"  Min score : {args.minscore}")
+    print(f"  Extensions: {', '.join(extensions)}")
+    print(f"  Workers   : {args.workers}")
+    if args.exclude:
+        print(f"  Excluding : {', '.join(args.exclude)}")
+    if args.resume:
+        print(f"  Resuming from checkpoint: {CHECKPOINT_FILE}")
+    print()
 
+    detections = scan_directory(
+        args.directory,
+        report_number,
+        error_log_number=1,
+        extensions=extensions,
+        exclude_dirs=set(args.exclude),
+        resume=args.resume,
+        workers=args.workers,
+    )
 
-    images_with_detections = scan_directory(args.directory, report_number, error_log_number)
-
-    if images_with_detections:
-        print("NudeNet Detection Report(s) generated in 'reports' directory.")
+    if detections:
+        print(f"\nDone. {len(detections)} detection(s) — reports saved to 'reports/'")
     else:
-        print("No images with detections found in the specified directory.")
+        print("\nDone. No detections found.")
+
+    print(f"FOUND: {found}")
 
 if __name__ == "__main__":
     main()
-    clean_cache_directory('cache', 1) #clean after yourself man..
-    print("FOUND: " + str(found))
+    clean_cache_directory('cache', 1)
