@@ -32,6 +32,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 DEFAULT_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff')
+DEFAULT_TIMEOUT_SECONDS = 60  # per-image watchdog timeout
 
 all_labels = [
     "BUTTOCKS_EXPOSED",
@@ -49,6 +50,7 @@ all_labels = [
 
 found = 0
 default_detection_score = 0.6
+detection_timeout = DEFAULT_TIMEOUT_SECONDS
 previous_report_number = None
 output_dir = 'reports'
 
@@ -388,7 +390,7 @@ def log_error(n, message):
         f.write(f"{datetime.now()} - {message}\n")
 
 def clean_cache_directory(cache_dir, max_size_bytes):
-    """Evict oldest flat files in cache_dir. Skips subdirs (e.g. active zip_temp_* folders)."""
+    """Evict oldest flat files in cache_dir. Skips subdirs (e.g. active arc_temp_* folders)."""
     try:
         entries = [
             os.path.join(cache_dir, fn)
@@ -422,16 +424,62 @@ def is_complex_image(image_path):
     return len(c_thresh) > 5 or len(c_edges) > 5
 
 # ---------------------------------------------------------------------------
+# Watchdog timeout wrapper
+# ---------------------------------------------------------------------------
+
+class TimeoutResult:
+    """Sentinel returned when a watched call exceeds the timeout."""
+    pass
+
+TIMED_OUT = TimeoutResult()
+
+def run_with_timeout(func, args=(), kwargs=None, timeout=DEFAULT_TIMEOUT_SECONDS):
+    """
+    Run func(*args, **kwargs) on a daemon thread and wait up to `timeout` seconds.
+    Returns (result, timed_out_bool). If the call hangs (e.g. a corrupt image
+    stalling cv2 or the ONNX runtime), the watcher gives up and returns
+    (TIMED_OUT, True) so the main scan loop can log it and move on — the
+    stuck worker thread is abandoned (daemon=True keeps it from blocking exit).
+    """
+    kwargs = kwargs or {}
+    box = {}
+    exc_box = {}
+
+    def _target():
+        try:
+            box['result'] = func(*args, **kwargs)
+        except Exception as e:
+            exc_box['error'] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout)
+
+    if t.is_alive():
+        return TIMED_OUT, True
+    if 'error' in exc_box:
+        raise exc_box['error']
+    return box.get('result'), False
+
+# ---------------------------------------------------------------------------
 # Core scan logic
 # ---------------------------------------------------------------------------
 
+def _detect_pipeline(full_path):
+    """The actual potentially-slow/blocking work: complexity check + NudeNet detect."""
+    nude_detector = get_detector()
+    if not is_complex_image(full_path):
+        return None
+    return nude_detector.detect(full_path)
+
+
 def scan_image(full_path, error_log_number):
     """
-    Scan a single image using a per-thread NudeDetector.
-    Returns matched_classes on detection, [] on clean, None on error/skip.
+    Scan a single image using a per-thread NudeDetector, guarded by a watchdog
+    timeout so a single corrupt/oversized image can never hang the whole scan.
+    Returns matched_classes on detection, [] on clean, None on error/skip/timeout.
     """
     sanitized = sanitize_filename(os.path.basename(full_path))
-    nude_detector = get_detector()
 
     try:
         img = Image.open(full_path)
@@ -446,21 +494,15 @@ def scan_image(full_path, error_log_number):
             log_error(error_log_number, f"Cannot copy to cache {full_path}: {e2}")
             return None
 
-    try:
-        if not is_complex_image(full_path):
-            return None
-        detections = nude_detector.detect(full_path)
-    except Exception as e:
-        log_error(error_log_number, f"Detection error {full_path}: {e}")
-        temp_path = get_cache_filename(sanitized)
-        try:
-            shutil.copyfile(full_path, temp_path)
-            if not is_complex_image(temp_path):
-                return None
-            detections = nude_detector.detect(temp_path)
-        except Exception as e2:
-            log_error(error_log_number, f"Cached detection error {full_path}: {e2}")
-            return None
+    detections, timed_out = run_with_timeout(_detect_pipeline, args=(full_path,), timeout=detection_timeout)
+
+    if timed_out:
+        log_error(error_log_number, f"TIMEOUT after {detection_timeout}s — skipped: {full_path}")
+        print(f"  [!] TIMEOUT ({detection_timeout}s) — skipping: {os.path.basename(full_path)}", flush=True)
+        return None
+
+    if detections is None:
+        return None  # not complex enough, or detection raised inside pipeline (already caught below)
 
     matched = [
         {'class': d['class'], 'score': d['score']}
@@ -489,14 +531,11 @@ def handle_detection(matched_classes, full_path, report_number_ref, images_with_
         update_report(get_report_filename(report_number), full_path, matched_classes, display_path=display_path)
 
 # ---------------------------------------------------------------------------
-# Archive scanning (.zip / .7z / .rar)
+# Archive scanning (.zip / .7z / .rar) with verbose progress output
 # ---------------------------------------------------------------------------
 
 def _extract_archive(archive_path, temp_dir, error_log_number):
-    """
-    Extract any supported archive type to temp_dir with live progress output.
-    Returns True on success, False on failure.
-    """
+    """Extract any supported archive type to temp_dir, printing periodic progress."""
     lower = archive_path.lower()
     name = os.path.basename(archive_path)
     try:
@@ -504,20 +543,20 @@ def _extract_archive(archive_path, temp_dir, error_log_number):
             with zipfile.ZipFile(archive_path, 'r') as zf:
                 members = zf.namelist()
                 total = len(members)
-                print(f"\n  [ZIP] Extracting {total} entries from: {name}", flush=True)
+                print(f"  [ZIP] Extracting {total} entries from: {name}", flush=True)
                 for i, member in enumerate(members, 1):
                     zf.extract(member, temp_dir)
                     if i % 200 == 0 or i == total:
-                        print(f"\r  [ZIP] Extracting... {i}/{total} entries", end='', flush=True)
-                print(f"\r  [ZIP] Extraction complete: {total} entries from {name}     ", flush=True)
+                        print(f"  [ZIP] Extracting... {i}/{total} entries", end='\r', flush=True)
+                print(f"  [ZIP] Extraction complete: {total} entries from {name}", flush=True)
         elif lower.endswith('.7z'):
             if not HAS_7Z:
                 log_error(error_log_number, f"py7zr not installed, skipping {archive_path}")
                 return False
-            print(f"\n  [7Z] Extracting: {name} (this may take a while)...", flush=True)
+            print(f"  [7Z] Extracting {name} — this may take a while...", flush=True)
             with py7zr.SevenZipFile(archive_path, mode='r') as sz:
                 all_files = sz.getnames()
-                print(f"  [7Z] {len(all_files)} entries found — extracting...", flush=True)
+                print(f"  [7Z] {len(all_files)} entries found, extracting...", flush=True)
                 sz.extractall(path=temp_dir)
             print(f"  [7Z] Extraction complete: {name}", flush=True)
         elif lower.endswith('.rar'):
@@ -527,18 +566,18 @@ def _extract_archive(archive_path, temp_dir, error_log_number):
             with rarfile.RarFile(archive_path, 'r') as rf:
                 members = rf.namelist()
                 total = len(members)
-                print(f"\n  [RAR] Extracting {total} entries from: {name}", flush=True)
+                print(f"  [RAR] Extracting {total} entries from: {name}", flush=True)
                 for i, member in enumerate(members, 1):
                     rf.extract(member, temp_dir)
                     if i % 200 == 0 or i == total:
-                        print(f"\r  [RAR] Extracting... {i}/{total} entries", end='', flush=True)
-                print(f"\r  [RAR] Extraction complete: {total} entries from {name}     ", flush=True)
+                        print(f"  [RAR] Extracting... {i}/{total} entries", end='\r', flush=True)
+                print(f"  [RAR] Extraction complete: {total} entries from {name}", flush=True)
         else:
             return False
         return True
     except Exception as e:
         log_error(error_log_number, f"Failed to extract {archive_path}: {e}")
-        print(f"\n  [!] Failed to extract {name}: {e}", flush=True)
+        print(f"  [!] Failed to extract {name}: {e}", flush=True)
         return False
 
 
@@ -560,30 +599,21 @@ def scan_archive(archive_path, report_number_ref, error_log_number, images_with_
         shutil.rmtree(temp_dir, ignore_errors=True)
         return
 
-    # Collect all image files from the extracted archive
     image_files = [
         os.path.join(root, f)
         for root, _, files in os.walk(temp_dir)
         for f in files
         if f.lower().endswith(extensions)
     ]
-
     img_count = len(image_files)
+
     if img_count == 0:
         print(f"  [ARC] No scannable images found inside {name}", flush=True)
         shutil.rmtree(temp_dir, ignore_errors=True)
         return
 
     print(f"  [ARC] Scanning {img_count} image(s) inside {name}...", flush=True)
-
-    with tqdm(
-        total=img_count,
-        desc=f"  {ext} {name[:40]}",
-        position=1,
-        leave=False,
-        dynamic_ncols=True,
-        unit='img'
-    ) as arc_pbar:
+    with tqdm(total=img_count, desc=f"  {ext} {name[:40]}", position=1, leave=False, dynamic_ncols=True, unit='img') as arc_pbar:
         for full_path in image_files:
             if _shutdown.is_set():
                 break
@@ -602,10 +632,8 @@ def scan_archive(archive_path, report_number_ref, error_log_number, images_with_
 # ---------------------------------------------------------------------------
 
 ARCHIVE_EXTENSIONS = ('.zip',)
-if HAS_7Z:  _ARCHIVE_EXTS_7Z  = ('.7z',)
-else:        _ARCHIVE_EXTS_7Z  = ()
-if HAS_RAR: _ARCHIVE_EXTS_RAR = ('.rar',)
-else:        _ARCHIVE_EXTS_RAR = ()
+_ARCHIVE_EXTS_7Z  = ('.7z',) if HAS_7Z else ()
+_ARCHIVE_EXTS_RAR = ('.rar',) if HAS_RAR else ()
 ALL_ARCHIVE_EXTENSIONS = ARCHIVE_EXTENSIONS + _ARCHIVE_EXTS_7Z + _ARCHIVE_EXTS_RAR
 
 
@@ -625,7 +653,6 @@ def scan_directory(directory, report_number_ref, error_log_number, extensions, e
 
         dirs[:] = [d for d in dirs if d not in exclude_dirs]
 
-        # Announce each directory so user can see progress through the tree
         print(f"\n[DIR] {subdir}  ({len(files)} file(s))", flush=True)
 
         pbar = tqdm(
@@ -684,7 +711,7 @@ def scan_directory(directory, report_number_ref, error_log_number, extensions, e
 # ---------------------------------------------------------------------------
 
 def main():
-    global default_detection_score, output_dir
+    global default_detection_score, output_dir, detection_timeout
 
     parser = argparse.ArgumentParser(
         description='Offline NSFW image scanner using NudeNet.',
@@ -696,11 +723,16 @@ Examples:
   python script.py C:/ --exclude Windows --exclude "Program Files" --workers 4
   python script.py C:/ --extensions .jpg .jpeg .png --resume
   python script.py D:/ --output D:/scan_results
+  python script.py D:/ --timeout 30
 
 Archive support:
   .zip  built-in
   .7z   requires: pip install py7zr
   .rar  requires: pip install rarfile  (+ WinRAR/unrar binary in PATH)
+
+Timeout:
+  If a single image hangs cv2/NudeNet for longer than --timeout seconds,
+  it is skipped and logged instead of freezing the entire scan.
 """
     )
     parser.add_argument('directory',    type=str,           help='Directory or drive to scan')
@@ -716,10 +748,14 @@ Archive support:
                         help='Resume interrupted scan from checkpoint')
     parser.add_argument('--output',     type=str, default='reports',
                         help='Directory to write reports into (default: reports/)')
+    parser.add_argument('--timeout',    type=int, default=DEFAULT_TIMEOUT_SECONDS,
+                        help=f'Per-image watchdog timeout in seconds (default: {DEFAULT_TIMEOUT_SECONDS}). '
+                             'A single hung/corrupt image is skipped instead of freezing the scan.')
 
     args = parser.parse_args()
     default_detection_score = args.minscore
     output_dir = args.output
+    detection_timeout = args.timeout
 
     extensions = tuple(e if e.startswith('.') else f'.{e}' for e in args.extensions)
 
@@ -742,6 +778,7 @@ Archive support:
     print(f"Exts     : {', '.join(extensions)}")
     print(f"Archives : {', '.join(archive_support)}")
     print(f"Workers  : {args.workers}")
+    print(f"Timeout  : {args.timeout}s per image")
     print(f"Output   : {output_dir}")
     if args.exclude:
         print(f"Excluding: {', '.join(args.exclude)}")
