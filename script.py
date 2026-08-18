@@ -27,12 +27,8 @@ try:
 except ImportError:
     HAS_RAR = False
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
 DEFAULT_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff')
-DEFAULT_TIMEOUT_SECONDS = 60  # per-image watchdog timeout
+DEFAULT_TIMEOUT_SECONDS = 60
 
 all_labels = [
     "BUTTOCKS_EXPOSED",
@@ -44,31 +40,25 @@ all_labels = [
     "MALE_GENITALIA_EXPOSED",
 ]
 
-# ---------------------------------------------------------------------------
-# Global state
-# ---------------------------------------------------------------------------
-
 found = 0
 default_detection_score = 0.6
 detection_timeout = DEFAULT_TIMEOUT_SECONDS
 previous_report_number = None
 output_dir = 'reports'
 
-report_lock = threading.Lock()
+# report_lock MUST be re-entrant: handle_detection() acquires it, then calls
+# update_report(), which also acquires it (same thread). A plain Lock() here
+# self-deadlocks on the very first detection written to the report.
+report_lock = threading.RLock()
 state_lock  = threading.Lock()
 _shutdown   = threading.Event()
 
-# Per-thread NudeDetector — NudeDetector is not thread-safe
 _thread_local = threading.local()
 
 def get_detector():
     if not hasattr(_thread_local, 'detector'):
         _thread_local.detector = NudeDetector()
     return _thread_local.detector
-
-# ---------------------------------------------------------------------------
-# Cache / Directory helpers
-# ---------------------------------------------------------------------------
 
 def create_cache_directory():
     os.makedirs('cache', exist_ok=True)
@@ -93,10 +83,6 @@ def get_report_filename(report_number, local=False):
     base = latest if latest else output_dir
     return os.path.join(base, f'nudenet_report_{report_number}.html')
 
-# ---------------------------------------------------------------------------
-# Checkpoint / resume
-# ---------------------------------------------------------------------------
-
 CHECKPOINT_FILE = 'scan_checkpoint.json'
 
 def load_checkpoint():
@@ -120,10 +106,6 @@ def clear_checkpoint():
         except Exception:
             pass
 
-# ---------------------------------------------------------------------------
-# Report helpers
-# ---------------------------------------------------------------------------
-
 def create_new_report(report_number, summary=False):
     report_file = get_report_filename(report_number)
     if not os.path.exists(report_file):
@@ -134,7 +116,9 @@ def create_new_report(report_number, summary=False):
 
 
 def update_report(report_file, image_path, matched_classes, display_path=None):
-    """Inject detection card before </ul> so HTML stays valid."""
+    """Inject detection card before </ul> so HTML stays valid.
+    Called only from handle_detection(), which already holds report_lock —
+    safe here because report_lock is an RLock."""
     label_path = display_path if display_path else image_path
     image_path_escaped = image_path.replace('\\', '\\\\').replace("'", "\\'")
     label_path_escaped = label_path.replace('\\', '\\\\').replace("'", "\\'")
@@ -367,10 +351,6 @@ def get_report_summary():
 </html>
 """
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def sanitize_filename(filename):
     _, ext = os.path.splitext(filename)
     return uuid.uuid4().hex + ext
@@ -390,7 +370,6 @@ def log_error(n, message):
         f.write(f"{datetime.now()} - {message}\n")
 
 def clean_cache_directory(cache_dir, max_size_bytes):
-    """Evict oldest flat files in cache_dir. Skips subdirs (e.g. active arc_temp_* folders)."""
     try:
         entries = [
             os.path.join(cache_dir, fn)
@@ -423,24 +402,12 @@ def is_complex_image(image_path):
     c_edges, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     return len(c_thresh) > 5 or len(c_edges) > 5
 
-# ---------------------------------------------------------------------------
-# Watchdog timeout wrapper
-# ---------------------------------------------------------------------------
-
 class TimeoutResult:
-    """Sentinel returned when a watched call exceeds the timeout."""
     pass
 
 TIMED_OUT = TimeoutResult()
 
 def run_with_timeout(func, args=(), kwargs=None, timeout=DEFAULT_TIMEOUT_SECONDS):
-    """
-    Run func(*args, **kwargs) on a daemon thread and wait up to `timeout` seconds.
-    Returns (result, timed_out_bool). If the call hangs (e.g. a corrupt image
-    stalling cv2 or the ONNX runtime), the watcher gives up and returns
-    (TIMED_OUT, True) so the main scan loop can log it and move on — the
-    stuck worker thread is abandoned (daemon=True keeps it from blocking exit).
-    """
     kwargs = kwargs or {}
     box = {}
     exc_box = {}
@@ -461,12 +428,7 @@ def run_with_timeout(func, args=(), kwargs=None, timeout=DEFAULT_TIMEOUT_SECONDS
         raise exc_box['error']
     return box.get('result'), False
 
-# ---------------------------------------------------------------------------
-# Core scan logic
-# ---------------------------------------------------------------------------
-
 def _detect_pipeline(full_path):
-    """The actual potentially-slow/blocking work: complexity check + NudeNet detect."""
     nude_detector = get_detector()
     if not is_complex_image(full_path):
         return None
@@ -474,11 +436,6 @@ def _detect_pipeline(full_path):
 
 
 def scan_image(full_path, error_log_number):
-    """
-    Scan a single image using a per-thread NudeDetector, guarded by a watchdog
-    timeout so a single corrupt/oversized image can never hang the whole scan.
-    Returns matched_classes on detection, [] on clean, None on error/skip/timeout.
-    """
     sanitized = sanitize_filename(os.path.basename(full_path))
 
     try:
@@ -502,7 +459,7 @@ def scan_image(full_path, error_log_number):
         return None
 
     if detections is None:
-        return None  # not complex enough, or detection raised inside pipeline (already caught below)
+        return None
 
     matched = [
         {'class': d['class'], 'score': d['score']}
@@ -513,7 +470,8 @@ def scan_image(full_path, error_log_number):
 
 
 def handle_detection(matched_classes, full_path, report_number_ref, images_with_detections, display_path=None):
-    """Thread-safe detection writer. report_number_ref is a list[int] mutable box."""
+    """Thread-safe detection writer. report_lock is an RLock so this
+    outer acquisition + update_report()'s inner acquisition don't deadlock."""
     global found, previous_report_number
 
     label = display_path or full_path
@@ -530,12 +488,7 @@ def handle_detection(matched_classes, full_path, report_number_ref, images_with_
             create_new_report(report_number)
         update_report(get_report_filename(report_number), full_path, matched_classes, display_path=display_path)
 
-# ---------------------------------------------------------------------------
-# Archive scanning (.zip / .7z / .rar) with verbose progress output
-# ---------------------------------------------------------------------------
-
 def _extract_archive(archive_path, temp_dir, error_log_number):
-    """Extract any supported archive type to temp_dir, printing periodic progress."""
     lower = archive_path.lower()
     name = os.path.basename(archive_path)
     try:
@@ -627,10 +580,6 @@ def scan_archive(archive_path, report_number_ref, error_log_number, images_with_
     print(f"  [ARC] Done scanning {name} — {img_count} image(s) processed", flush=True)
     shutil.rmtree(temp_dir, ignore_errors=True)
 
-# ---------------------------------------------------------------------------
-# Directory scanning
-# ---------------------------------------------------------------------------
-
 ARCHIVE_EXTENSIONS = ('.zip',)
 _ARCHIVE_EXTS_7Z  = ('.7z',) if HAS_7Z else ()
 _ARCHIVE_EXTS_RAR = ('.rar',) if HAS_RAR else ()
@@ -705,10 +654,6 @@ def scan_directory(directory, report_number_ref, error_log_number, extensions, e
     if not _shutdown.is_set():
         clear_checkpoint()
     return images_with_detections
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main():
     global default_detection_score, output_dir, detection_timeout
