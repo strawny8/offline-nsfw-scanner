@@ -451,7 +451,14 @@ def scan_image(full_path, error_log_number):
             log_error(error_log_number, f"Cannot copy to cache {full_path}: {e2}")
             return None
 
-    detections, timed_out = run_with_timeout(_detect_pipeline, args=(full_path,), timeout=detection_timeout)
+    try:
+        detections, timed_out = run_with_timeout(_detect_pipeline, args=(full_path,), timeout=detection_timeout)
+    except Exception as e:
+        # Restores original per-image error isolation: a decode failure (bad/corrupt
+        # image, unsupported format, cv2 returning None) must be skipped and logged,
+        # never allowed to propagate up and abort the entire scan.
+        log_error(error_log_number, f"Detection error {full_path}: {e}")
+        return None
 
     if timed_out:
         log_error(error_log_number, f"TIMEOUT after {detection_timeout}s — skipped: {full_path}")
